@@ -3,6 +3,7 @@ AGENTS.md
 node_modules/
 target/
 dist/
+src-tauri/gen/
 .env
 .env.*
 !.env.example
