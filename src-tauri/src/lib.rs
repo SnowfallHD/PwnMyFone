@@ -182,6 +182,10 @@ fn scan(app: &tauri::AppHandle) -> Result<Vec<Device>, String> {
         Path::new("/usr/sbin/ioreg"),
         &["-r", "-c", "IOUSBHostDevice", "-a"],
     )?;
+    // ioreg can return no archive when there are no matching USB services.
+    if xml.trim().is_empty() {
+        return Ok(Vec::new());
+    }
     let value = plist::Value::from_reader_xml(xml.as_bytes())
         .map_err(|e| format!("USB inventory unavailable: {e}"))?;
     let mut found = Vec::new();

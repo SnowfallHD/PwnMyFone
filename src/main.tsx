@@ -2,6 +2,7 @@ import React from "react";
 import { createRoot } from "react-dom/client";
 import { invoke } from "@tauri-apps/api/core";
 import "./style.css";
+
 type Device = {
   ecid: string;
   name: string;
@@ -17,6 +18,7 @@ type Job = {
   lines: string[];
   progress: [string, number] | null;
 };
+type Action = "prepare_firmware" | "erase_restore" | "enter_recovery";
 const emptyJob: Job = {
   phase: "",
   running: false,
@@ -25,33 +27,183 @@ const emptyJob: Job = {
   lines: [],
   progress: null,
 };
+
+function EraseDialog({
+  device,
+  disabled,
+  error,
+  onDismiss,
+  onErase,
+}: {
+  device: Device;
+  disabled: boolean;
+  error: string;
+  onDismiss: () => void;
+  onErase: (phrase: string) => void;
+}) {
+  const [phrase, setPhrase] = React.useState("");
+  const dialog = React.useRef<HTMLDialogElement>(null);
+  React.useEffect(() => {
+    dialog.current?.showModal();
+  }, []);
+  return (
+    <dialog
+      ref={dialog}
+      className="erase-dialog"
+      aria-labelledby="erase-title"
+      onCancel={(e) => {
+        e.preventDefault();
+        onDismiss();
+      }}
+    >
+      <div className="warning-icon" aria-hidden="true">
+        !
+      </div>
+      <div className="eyebrow">FINAL CONFIRMATION</div>
+      <h2 id="erase-title">
+        Erase this {device.product?.startsWith("iPad") ? "iPad" : "iPhone"}?
+      </h2>
+      <p>
+        All photos, apps, and settings will be permanently deleted. Restoring
+        removes the screen passcode.
+      </p>
+      <div className="confirm-device">
+        <strong>{device.name}</strong>
+        <span>
+          {device.product} · ECID {device.ecid}
+        </span>
+      </div>
+      <p className="ownership">
+        Activation Lock stays in place. Setup may require the Apple Account
+        previously linked to this device.
+      </p>
+      <label className="phrase-label">
+        Type <strong>ERASE</strong> to confirm
+        <input
+          autoComplete="off"
+          spellCheck={false}
+          value={phrase}
+          onChange={(e) => setPhrase(e.target.value)}
+          placeholder="ERASE"
+        />
+      </label>
+      {error && (
+        <p className="inline-error" role="alert">
+          {error}
+        </p>
+      )}
+      <div className="dialog-actions">
+        <button className="secondary" disabled={disabled} onClick={onDismiss}>
+          Keep my device
+        </button>
+        <button
+          className="danger"
+          disabled={phrase !== "ERASE" || disabled}
+          onClick={() => onErase(phrase)}
+        >
+          Erase and restore
+        </button>
+      </div>
+    </dialog>
+  );
+}
+
+function RecoveryHelp({
+  isPhone,
+  disabled,
+}: {
+  isPhone: boolean;
+  disabled: boolean;
+}) {
+  const [layout, setLayout] = React.useState("home");
+  const instructions = isPhone
+    ? layout === "home"
+      ? "Turn off the iPhone. Reconnect the cable and immediately hold Home until the cable/computer screen appears."
+      : layout === "seven"
+        ? "Turn off the iPhone. Reconnect the cable and immediately hold Volume Down until the cable/computer screen appears."
+        : "Turn off the iPhone. Reconnect the cable and immediately hold the side button past the Apple logo until the cable/computer screen appears."
+    : layout === "home"
+      ? "Hold Home and the top button together. When the iPad turns off, release the top button and keep holding Home until the cable/computer screen appears."
+      : "Press and release the volume button nearest the top button, then the other volume button. Hold the top button past the Apple logo until the recovery screen appears.";
+  return (
+    <details className="recovery-help">
+      <summary>Use buttons instead</summary>
+      <div className="help-content">
+        <label>
+          Device button layout
+          <select
+            disabled={disabled}
+            value={layout}
+            onChange={(e) => setLayout(e.target.value)}
+          >
+            <option value="home">
+              {isPhone ? "iPhone 6s or earlier" : "iPad with Home button"}
+            </option>
+            {isPhone && <option value="seven">iPhone 7 / 7 Plus</option>}
+            <option value="modern">
+              {isPhone ? "iPhone 8 or later" : "iPad without Home button"}
+            </option>
+          </select>
+        </label>
+        <p>Keep the device connected to this Mac. {instructions}</p>
+      </div>
+    </details>
+  );
+}
+
 function App() {
   const [snapshot, setSnapshot] = React.useState<Snapshot>({
     devices: [],
     ready: false,
     issue: null,
   });
-  const [job, setJob] = React.useState<Job>(emptyJob);
+  const [job, setJob] = React.useState(emptyJob);
   const [selected, setSelected] = React.useState("");
   const [error, setError] = React.useState("");
+  const [scanError, setScanError] = React.useState("");
   const [checking, setChecking] = React.useState(true);
   const [busy, setBusy] = React.useState(false);
   const [confirm, setConfirm] = React.useState(false);
-  const [phrase, setPhrase] = React.useState("");
-  const [home, setHome] = React.useState(true);
+  const [helloVerified, setHelloVerified] = React.useState(false);
+  const reviewButton = React.useRef<HTMLButtonElement>(null);
+  const pending = React.useRef(false);
+  const revision = React.useRef(0);
   const device = snapshot.devices.find((d) => d.ecid === selected);
   const ready = job.phase === "ready" && job.ecid === selected;
+  const active = job.running || busy;
+  const completed =
+    job.phase === "complete" && (!device || job.ecid === device.ecid);
+  const recovery = device?.mode === "Recovery";
+  const identified = !!device?.product?.match(/^(iPad|iPhone)/);
+  const canOperate =
+    !!device &&
+    identified &&
+    snapshot.ready &&
+    !scanError &&
+    !active &&
+    (device.mode === "Normal" || recovery);
+  const canErase = canOperate && ready && recovery;
+  const isPhone = device?.product?.startsWith("iPhone") ?? false;
+  const noun = isPhone ? "iPhone" : "iPad";
+  const needsRecovery =
+    !!device &&
+    !active &&
+    ((ready && !recovery) || !identified || device.mode === "DFU");
+
   React.useEffect(() => {
     let stopped = false;
+    let timer: number;
     async function poll() {
+      const version = revision.current;
       try {
         const current = await invoke<Job>("job_status");
-        if (stopped) return;
+        if (stopped || version !== revision.current) return;
         setJob(current);
         if (!current.running) {
           const result = await invoke<Snapshot>("device_snapshot");
-          if (stopped) return;
+          if (stopped || version !== revision.current) return;
           setSnapshot(result);
+          setScanError("");
           setSelected((prev) =>
             result.devices.some((d) => d.ecid === prev)
               ? prev
@@ -61,7 +213,7 @@ function App() {
           );
         }
       } catch (e) {
-        if (!stopped) setError(String(e));
+        if (!stopped && version === revision.current) setScanError(String(e));
       } finally {
         if (!stopped) {
           setChecking(false);
@@ -69,20 +221,38 @@ function App() {
         }
       }
     }
-    let timer = window.setTimeout(poll, 0);
+    timer = window.setTimeout(poll, 0);
     return () => {
       stopped = true;
       window.clearTimeout(timer);
     };
   }, []);
   React.useEffect(() => {
+    if (!canErase) setConfirm(false);
+  }, [canErase]);
+  React.useEffect(() => {
+    setError("");
     setConfirm(false);
-    setPhrase("");
   }, [selected]);
-  async function action(
-    kind: "prepare_firmware" | "erase_restore" | "enter_recovery",
-  ) {
-    if (!device || busy || job.running) return;
+  React.useEffect(() => {
+    setHelloVerified(false);
+  }, [job.phase, job.ecid, selected]);
+
+  function dismissReview() {
+    setConfirm(false);
+    window.requestAnimationFrame(() => reviewButton.current?.focus());
+  }
+
+  async function action(kind: Action, phrase?: string) {
+    if (
+      !device ||
+      pending.current ||
+      job.running ||
+      (kind === "erase_restore" && !canErase)
+    )
+      return;
+    pending.current = true;
+    revision.current++;
     setBusy(true);
     setError("");
     try {
@@ -91,315 +261,369 @@ function App() {
         ...(kind === "erase_restore" ? { confirmation: phrase } : {}),
       });
       setConfirm(false);
-      setPhrase("");
       setJob(await invoke<Job>("job_status"));
     } catch (e) {
       setError(String(e));
     } finally {
+      pending.current = false;
       setBusy(false);
     }
   }
-  const active = job.running || busy;
+
+  const stage = completed
+    ? 3
+    : job.phase === "restoring"
+      ? 2
+      : ready
+        ? recovery
+          ? 2
+          : 1
+        : job.phase === "recovering"
+          ? 1
+          : 0;
+  const title = active
+    ? job.phase === "restoring"
+      ? `Restoring your ${noun}.`
+      : job.phase === "recovering"
+        ? "Entering recovery mode."
+        : "Preparing your fresh start."
+    : completed
+      ? helloVerified
+        ? "Your fresh start is ready."
+        : "Check your device."
+      : !device
+        ? snapshot.devices.length > 1
+          ? "Choose your device."
+          : "Let’s get you connected."
+        : needsRecovery
+          ? "One more step: recovery."
+          : ready
+            ? "Ready when you are."
+            : `A fresh start for your ${noun}.`;
+  const description = active
+    ? job.phase === "restoring"
+      ? "Keep the cable connected and this app open while your device is erased and restored."
+      : job.phase === "recovering"
+        ? "Your device will restart. We’ll check that the same device returns in recovery mode."
+        : "We’re downloading and checking compatible firmware. Your data stays on the device during this step."
+    : completed
+      ? helloVerified
+        ? "You confirmed the Hello screen. Follow setup on the device; the linked Apple Account may still be required."
+        : "The restore engine reported completion. Confirm that the device shows the Hello setup screen."
+      : !device
+        ? "Connect an iPad or iPhone with a USB data cable. We’ll take it from there."
+        : needsRecovery
+          ? "We need your device in recovery mode before continuing. This restart does not erase data."
+          : ready
+            ? "Firmware is checked and recovery mode is confirmed. Review exactly what will be erased before continuing."
+            : "We’ll prepare compatible firmware and enter recovery automatically. You choose when to erase.";
+  const firmware = job.lines
+    .find((l) => l.startsWith("Selected firmware "))
+    ?.replace("Selected firmware ", "");
+  const shownError =
+    error ||
+    scanError ||
+    snapshot.issue ||
+    (job.phase === "failed" ? job.message : "");
+
   return (
-    <main>
-      <header>
-        <div className="brand">
-          PwnMyFone<span>DEVICE TOOLKIT</span>
-        </div>
-        <span className="version">Development · macOS</span>
-      </header>
-      <div className="workspace">
-        <section className="device-area">
-          <div
-            className={`device-art ${device ? "connected" : "searching"} ${active ? "working" : ""}`}
-            aria-hidden="true"
-          >
-            <div className="orbit orbit-one" />
-            <div className="orbit orbit-two" />
-            <div className="phone">
-              <div className="camera" />
-              <div className="screen-symbol">{device ? "✓" : ""}</div>
-              <div className="home-dot" />
-            </div>
-            <div className="cable">
-              <div className="connector" />
-            </div>
-          </div>
-          <h1>
-            {job.phase === "complete"
-              ? "Hello, fresh start."
-              : device
-                ? "Your device is connected."
-                : "Plug in your device."}
-          </h1>
-          <p>
-            {device
-              ? "We’ll prepare compatible firmware, then erase and restore your device to remove its screen passcode."
-              : "Connect your iPad or iPhone with a USB data cable. We’ll detect it automatically."}
-          </p>
-          <div className="connection" role="status">
-            <span className={`dot ${device ? "online" : ""}`} />
-            {active
-              ? "Device operation in progress"
-              : checking
-                ? "Checking USB connection…"
-                : device
-                  ? `${device.name} · ${device.mode} mode`
-                  : "Waiting for a device · checking automatically"}
-          </div>
-          {snapshot.devices.length > 1 && (
-            <label className="select-label">
-              Choose your device
-              <select
-                disabled={active}
-                value={selected}
-                onChange={(e) => setSelected(e.target.value)}
-              >
-                <option value="">Select a device</option>
-                {snapshot.devices.map((d) => (
-                  <option value={d.ecid} key={d.ecid}>
-                    {d.name} · ECID {d.ecid}
-                  </option>
-                ))}
-              </select>
-            </label>
-          )}
-          {device && (
-            <div className="identity">
-              <span>{device.product ?? "Model not yet identified"}</span>
-              <span>ECID {device.ecid}</span>
-            </div>
-          )}
-        </section>
-        <aside className="workflow">
-          <h2>Remove screen passcode</h2>
-          <p className="intro">
-            A full erase and firmware restore. Your photos, apps, and settings
-            will be removed.
-          </p>
-          <div className="step">
-            <span className={`step-number ${ready ? "done" : ""}`}>1</span>
-            <div>
-              <h3>Prepare firmware</h3>
-              <p>
-                Download and check currently signed firmware. Requires internet
-                and 25 GB of free space on this Mac.
-              </p>
-              <button
-                disabled={!device || !snapshot.ready || active || ready}
-                onClick={() => action("prepare_firmware")}
-              >
-                {job.phase === "preparing"
-                  ? "Preparing firmware…"
-                  : ready
-                    ? "Firmware ready"
-                    : "Download firmware"}
-              </button>
-            </div>
-          </div>
-          <div className="step">
-            <span
-              className={`step-number ${device?.mode === "Recovery" ? "done" : ""}`}
-            >
-              2
+    <>
+      <main>
+        <header>
+          <div className="brand">
+            <span className="brand-mark" aria-hidden="true">
+              <i />
             </span>
-            <div>
-              <h3>Enter recovery mode automatically</h3>
-              <p>
-                After firmware preparation, we ask the selected device to
-                restart into recovery. This does not erase data.
-              </p>
-              <button
-                disabled={!device || active || device.mode !== "Normal"}
-                onClick={() => action("enter_recovery")}
+            PwnMyFone
+          </div>
+          <span className="build-label">LOCAL RECOVERY · PREVIEW</span>
+        </header>
+        <section className="recovery-surface" aria-labelledby="stage-title">
+          <div className="ambient ambient-one" aria-hidden="true" />
+          <div className="ambient ambient-two" aria-hidden="true" />
+          <div className="journey" aria-label="Recovery stages">
+            {["Prepare", "Recovery", "Restore"].map((label, i) => (
+              <div
+                key={label}
+                className={`journey-step ${stage > i ? "done" : stage === i ? "current" : ""}`}
+                aria-current={stage === i ? "step" : undefined}
               >
-                Enter recovery now
-              </button>
-              <details>
-                <summary>
-                  Button instructions if automatic recovery fails
-                </summary>
-                <div
-                  className="toggle"
-                  role="group"
-                  aria-label="Device button layout"
-                >
-                  <button
-                    className={home ? "chosen" : ""}
-                    disabled={active}
-                    onClick={() => setHome(true)}
-                  >
-                    Home button
-                  </button>
-                  <button
-                    className={!home ? "chosen" : ""}
-                    disabled={active}
-                    onClick={() => setHome(false)}
-                  >
-                    No Home button
-                  </button>
-                </div>
-                <p>
-                  {home
-                    ? "Turn off your iPad, then reconnect it. Hold Home and the top button together. Keep holding past the Apple logo until the cable/computer screen appears."
-                    : "Turn off and reconnect your iPad. Without Home: press and release the volume button nearest the top button, then the other volume button. Hold the top button past the Apple logo until the recovery screen appears."}
-                </p>
-                <small>
-                  If recovery mode expires during download, enter it again
-                  afterward. Keep the device charged. These button instructions
-                  are for iPad.
-                </small>
-              </details>
-              <div className="mode-state">
-                {device?.mode === "Recovery"
-                  ? "Recovery mode detected ✓"
-                  : "Waiting for recovery mode"}
+                <span>{stage > i ? "✓" : i + 1}</span>
+                {label}
               </div>
-            </div>
+            ))}
           </div>
-          <div className="step">
-            <span className="step-number">3</span>
-            <div>
-              <h3>Erase and restore</h3>
-              <p>
-                Activation Lock stays in place. You may need the linked Apple
-                Account during setup.
-              </p>
-              <button
-                className="danger"
-                disabled={
-                  !device || !ready || device.mode !== "Recovery" || active
-                }
-                onClick={() => setConfirm(true)}
-              >
-                Review erase confirmation
-              </button>
-            </div>
-          </div>
-        </aside>
-      </div>
-      {(error || snapshot.issue) && (
-        <div className="error" role="alert">
-          {error || snapshot.issue}
-        </div>
-      )}
-      {job.phase && (
-        <section className="operation" aria-live="polite">
-          <div className="operation-heading">
-            <h2>
-              {(
-                {
-                  preparing: "Preparing firmware",
-                  ready: "Ready for recovery",
-                  recovering: "Entering recovery mode",
-                  recovery: "Recovery request finished",
-                  restoring: "Restoring device",
-                  complete: "Restore engine completed",
-                  failed: "Operation needs attention",
-                } as Record<string, string>
-              )[job.phase] ?? job.phase}
-            </h2>
-            {job.running && <span className="spinner" />}
-          </div>
-          <p>{job.message}</p>
-          {job.progress && job.running && (
-            <div className="progress">
-              <span>
-                {job.progress[0]} · {job.progress[1].toFixed(0)}%
+          <div className="stage-layout">
+            <div
+              className={`device-scene ${isPhone ? "is-phone" : "is-tablet"} ${device || active || completed ? "connected" : "searching"} ${active ? "working" : ""} ${completed ? "finished" : ""}`}
+              aria-hidden="true"
+            >
+              <div className="device-halo" />
+              <div className="device-body">
+                <div className="camera" />
+                <div className="device-screen">
+                  {completed ? (
+                    <span className="hello">hello</span>
+                  ) : active ? (
+                    <span className="device-loader" />
+                  ) : device ? (
+                    <span className="screen-check">✓</span>
+                  ) : (
+                    <span className="screen-usb">↧</span>
+                  )}
+                </div>
+                <div className="home-dot" />
+              </div>
+              {!completed && (
+                <div className="cable">
+                  <div className="connector" />
+                  <div className="cable-line" />
+                </div>
+              )}
+              <span className="scene-caption">
+                {completed
+                  ? "CHECK THE SETUP SCREEN"
+                  : active
+                    ? "KEEP CONNECTED"
+                    : device
+                      ? "CONNECTED TO THIS MAC"
+                      : "USB CONNECTION"}
               </span>
-              <progress max="100" value={job.progress[1]} />
             </div>
-          )}
-          {job.lines.length > 0 && (
-            <details open={job.running || job.phase === "failed"}>
-              <summary>Live engine output · stays on this Mac</summary>
-              <pre>{job.lines.join("\n")}</pre>
+            <div className="stage-content">
+              <div className="eyebrow">
+                {active
+                  ? "WORKING ON IT"
+                  : completed
+                    ? "YOUR DEVICE, YOUR NEXT STEP"
+                    : ready
+                      ? "FINAL STEP"
+                      : "SCREEN PASSCODE RECOVERY"}
+              </div>
+              <h1 id="stage-title">{title}</h1>
+              <p className="stage-description">{description}</p>
+              {snapshot.devices.length > 1 && !active && !completed && (
+                <label className="device-choice">
+                  Connected devices
+                  <select
+                    value={selected}
+                    onChange={(e) => setSelected(e.target.value)}
+                  >
+                    <option value="">Choose a device</option>
+                    {snapshot.devices.map((d) => (
+                      <option key={d.ecid} value={d.ecid}>
+                        {d.name} · {d.ecid}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              )}
+              {device && !completed && (
+                <div className="device-summary">
+                  <div>
+                    <strong>
+                      {device.name === "iPad" || device.name === "iPhone"
+                        ? `${device.name} · ${device.product ?? "Identifying model"}`
+                        : device.name}
+                    </strong>
+                    <span>
+                      {active
+                        ? "Operation in progress"
+                        : (device.product ?? "Model not yet identified")}
+                    </span>
+                  </div>
+                  <span className={`mode-badge ${recovery ? "verified" : ""}`}>
+                    {active
+                      ? "Connected"
+                      : recovery
+                        ? "Recovery ✓"
+                        : device.mode}
+                  </span>
+                </div>
+              )}
+              {shownError && (
+                <div className="error-card" role="alert">
+                  <strong>Let’s resolve this first.</strong>
+                  <p>{shownError}</p>
+                </div>
+              )}
+              <div className="action-area">
+                {active ? (
+                  <div className="progress-card">
+                    <div className="progress-heading">
+                      <span className="spinner" />
+                      <strong>
+                        {job.progress
+                          ? `${job.progress[0]} firmware`
+                          : job.phase === "recovering"
+                            ? "Waiting for recovery"
+                            : job.phase === "restoring"
+                              ? "Restore in progress"
+                              : "Finding compatible firmware"}
+                      </strong>
+                      {job.progress && (
+                        <span className="progress-number">
+                          {job.progress[1].toFixed(0)}%
+                        </span>
+                      )}
+                    </div>
+                    <progress
+                      aria-label={job.progress?.[0] ?? "Device operation"}
+                      max="100"
+                      {...(job.progress ? { value: job.progress[1] } : {})}
+                    />
+                    <p>
+                      {job.phase === "restoring"
+                        ? "The device may restart several times."
+                        : job.phase === "recovering"
+                          ? "A brief USB disconnect is expected during restart."
+                          : "Nothing is erased until you confirm the final step."}
+                    </p>
+                  </div>
+                ) : completed ? (
+                  helloVerified ? (
+                    <div className="completion-note">
+                      <span>✓</span> Hello screen confirmed by you
+                    </div>
+                  ) : (
+                    <button
+                      className="primary"
+                      onClick={() => setHelloVerified(true)}
+                    >
+                      I see the Hello screen <span aria-hidden="true">✓</span>
+                    </button>
+                  )
+                ) : !device ? (
+                  <div className="waiting-status" role="status">
+                    <span className="status-dot" />
+                    {checking
+                      ? "Checking USB…"
+                      : snapshot.devices.length > 1
+                        ? "Select the device you want to recover"
+                        : "Waiting for your device"}
+                  </div>
+                ) : needsRecovery ? (
+                  <>
+                    <button
+                      className="primary"
+                      disabled={!canOperate || device.mode !== "Normal"}
+                      onClick={() => action("enter_recovery")}
+                    >
+                      Enter recovery mode <span aria-hidden="true">↗</span>
+                    </button>
+                    <RecoveryHelp isPhone={isPhone} disabled={active} />
+                    {ready && (
+                      <p className="action-caption">
+                        Your checked firmware is still ready.
+                      </p>
+                    )}
+                  </>
+                ) : ready ? (
+                  <>
+                    <button
+                      className="primary"
+                      disabled={!canErase}
+                      ref={reviewButton}
+                      onClick={() => setConfirm(true)}
+                    >
+                      Review erase confirmation{" "}
+                      <span aria-hidden="true">→</span>
+                    </button>
+                    <p className="action-caption">
+                      Nothing is erased by opening this review.
+                    </p>
+                  </>
+                ) : (
+                  <>
+                    <button
+                      className="primary"
+                      disabled={!canOperate}
+                      onClick={() => action("prepare_firmware")}
+                    >
+                      {job.phase === "failed"
+                        ? "Try preparation again"
+                        : `Prepare my ${noun}`}
+                      <span aria-hidden="true">→</span>
+                    </button>
+                    <p className="action-caption">
+                      Internet required · 25 GB free for a new download
+                    </p>
+                  </>
+                )}
+              </div>
+              {!active && device && !completed && (
+                <div className="consequence">
+                  <span className="small-lock" aria-hidden="true" />
+                  <p>
+                    <strong>Erase removes all device data.</strong> Activation
+                    Lock remains; setup may need the linked Apple Account.
+                  </p>
+                </div>
+              )}
+              {needsRecovery && job.phase === "ready" && (
+                <p className="recovery-note" role="status">
+                  {job.message}
+                </p>
+              )}
+            </div>
+          </div>
+          <div className="surface-footer">
+            <span>
+              <span className={`status-dot ${device ? "online" : ""}`} />
+              {active
+                ? "Keep this app open"
+                : completed
+                  ? "Restore engine finished"
+                  : device
+                    ? "Device detected"
+                    : "Detection is automatic"}
+            </span>
+            <span>
+              {ready
+                ? "Signed firmware checked"
+                : active
+                  ? "Local device operation"
+                  : "You control the erase"}
+            </span>
+          </div>
+        </section>
+        <div className="below-surface">
+          <span className="privacy-note">Device logs stay on this Mac.</span>
+          {(device || job.lines.length > 0) && (
+            <details className="technical-details">
+              <summary>Device &amp; operation details</summary>
+              <div className="technical-content">
+                {device && (
+                  <p>
+                    {device.product} · ECID {device.ecid}
+                  </p>
+                )}
+                {firmware && <p>Firmware: {firmware}</p>}
+                {job.message && <p>{job.message}</p>}
+                {job.lines.length > 0 && (
+                  <pre tabIndex={0} aria-label="Local engine output">
+                    {job.lines.join("\n")}
+                  </pre>
+                )}
+              </div>
             </details>
           )}
-        </section>
-      )}
-      {confirm && device && (
-        <div className="modal-backdrop">
-          <div
-            className="modal"
-            role="dialog"
-            aria-modal="true"
-            aria-labelledby="erase-title"
-            onKeyDown={(event) => {
-              if (event.key === "Escape") {
-                setConfirm(false);
-                setPhrase("");
-              }
-              if (event.key === "Tab") {
-                const controls = Array.from(
-                  event.currentTarget.querySelectorAll<HTMLElement>(
-                    "input, button:not(:disabled)",
-                  ),
-                );
-                const first = controls[0],
-                  last = controls[controls.length - 1];
-                if (event.shiftKey && document.activeElement === first) {
-                  event.preventDefault();
-                  last?.focus();
-                }
-                if (!event.shiftKey && document.activeElement === last) {
-                  event.preventDefault();
-                  first?.focus();
-                }
-              }
-            }}
-          >
-            <h2 id="erase-title">Erase this {device.name}?</h2>
-            <p>
-              All data on this device will be permanently removed. The screen
-              passcode will be removed through a firmware restore. Activation
-              Lock is not removed.
-            </p>
-            <div className="target">
-              {device.product} · ECID {device.ecid}
-            </div>
-            <label>
-              Type <strong>ERASE</strong> to confirm
-              <input
-                autoFocus
-                autoComplete="off"
-                value={phrase}
-                onChange={(e) => setPhrase(e.target.value)}
-                placeholder="ERASE"
-              />
-            </label>
-            <div className="modal-actions">
-              <button
-                className="secondary"
-                onClick={() => {
-                  setConfirm(false);
-                  setPhrase("");
-                }}
-              >
-                Keep my device
-              </button>
-              <button
-                className="danger"
-                disabled={
-                  phrase !== "ERASE" || active || device.mode !== "Recovery"
-                }
-                onClick={() => action("erase_restore")}
-              >
-                Erase and restore
-              </button>
-            </div>
-          </div>
         </div>
+        <footer>
+          <span>PwnMyFone · macOS development build</span>
+          <span>Screen passcode recovery through erase &amp; restore</span>
+        </footer>
+      </main>
+      {confirm && device && canErase && (
+        <EraseDialog
+          device={device}
+          disabled={active}
+          error={error}
+          onDismiss={dismissReview}
+          onErase={(phrase) => action("erase_restore", phrase)}
+        />
       )}
-      <footer>
-        <span>Tauri + Rust · local device operations</span>
-        <span>
-          {active
-            ? "Keep this app open and your device connected"
-            : "Apple Account ownership locks remain intact"}
-        </span>
-      </footer>
-    </main>
+    </>
   );
 }
 createRoot(document.getElementById("root")!).render(

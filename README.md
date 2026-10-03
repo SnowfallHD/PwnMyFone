@@ -6,7 +6,7 @@ A Tauri 2 desktop device toolkit with a Rust backend and React/TypeScript interf
 
 - Automatically detect USB-connected iPads/iPhones and show model, ECID, and normal/recovery mode.
 - Download and verify currently signed firmware through the existing idevicerestore engine, without erasing the device.
-- Show iPad recovery-mode instructions and an animated connection prompt.
+- Guide one step at a time with animated connection feedback, readable progress, and iPad/iPhone recovery instructions when needed.
 - Require firmware preparation for the same device, recovery mode, and an explicit `ERASE` confirmation before starting an erase restore.
 - Show live engine output and phase progress. Prevent ordinary window closing and app quitting while an operation is running.
 
@@ -43,3 +43,5 @@ The local debug bundle is generated at `src-tauri/target/debug/bundle/macos/PwnM
 See [restore workflow references](docs/restore-workflow.md) for Apple, Tenorshare, LockWiper, iMazing, and upstream engine documentation. Firmware is cached under the app's macOS cache directory. Engine output stays local and no telemetry is configured. Standard Apple signing/personalization contacts Apple during restoration. Third-party licensing/source obligations must be resolved before distributing bundled helpers publicly.
 
 Automatic recovery: after firmware verification, the app requests a non-erasing recovery restart for the selected USB device and verifies the same ECID returns in Recovery mode. An Enter recovery now button supports retries; manual iPad instructions remain as fallback when the device refuses the command. Detection alone never restarts or erases an attached device.
+
+Interface craft and validation boundaries are documented in [interface polish](docs/interface-polish.md). The completed restore screen asks the user to verify Hello on the physical device; the app does not detect that screen itself.
